@@ -23,4 +23,4 @@ molecule-plugins[docker]
 pre-commit
 # pytest-testinfra 10.1.1 contains a fix for SystemdService.exists
 # that is required by some roles' Molecule test code.
-pytest-testinfra>=10.1.1
+pytest-testinfra>=10.2.2
