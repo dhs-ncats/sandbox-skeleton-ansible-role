@@ -39,12 +39,12 @@ concurrency:
 
 jobs:
   publish:
-    # Only a MERGED PR, from this repo's own lineage/sync branch,
+    # Only a MERGED PR, from this repo's own review-proxy branch,
     # into a decoy base. Anything else (closed-not-merged, forks,
     # retargeted PRs) is ignored.
     if: >
       github.event.pull_request.merged == true &&
-      github.event.pull_request.head.ref == 'lineage/sync' &&
+      github.event.pull_request.head.ref == 'lineage/sync-review' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.base.ref, 'lineage/sync-base-')
     runs-on: ubuntu-latest
@@ -89,37 +89,68 @@ jobs:
           # only if $BRANCH still equals this value — so a wrong
           # marker can't overwrite anything, only refuse.
           snap=$(printf '%s' "$BODY" \
-            | grep -oE 'lineage-sync:base=[0-9a-f]{40}' | head -1 | cut -d= -f2)
+            | grep -m1 -oE 'lineage-sync:base=[0-9a-f]{40}' | cut -d= -f2)
           embedded="${BASE_REF#lineage/sync-base-}"
           case "$snap" in
             "$embedded"*) ;;
             *) echo "::error::PR body base marker ($snap) does not match the decoy name ($embedded) — not publishing"
                exit 1;;
           esac
-          # The reviewed head must be the merge's second parent.
+          # The reviewed head (the proxy) must be the merge's second
+          # parent, and the decoy tip (first parent) must be the
+          # snapshot itself.
           [ "$(git rev-parse "${MERGE_SHA}^2")" = "$HEAD_SHA" ] || {
             echo "::error::merge second parent != event head SHA — not publishing"
+            exit 1
+          }
+          [ "$(git rev-parse "${MERGE_SHA}^1")" = "$snap" ] || {
+            echo "::error::decoy tip != recorded snapshot — decoy was modified; not publishing"
+            exit 1
+          }
+
+          # What gets PUBLISHED is the real rebased history recorded
+          # at push time (pushed-sha marker), not the proxy — but only
+          # if the reviewed proxy's tree is byte-identical to it. A
+          # mismatch means lineage/sync was refreshed after review.
+          real=$(printf '%s' "$BODY" \
+            | grep -m1 -oE 'lineage-sync:pushed-sha=[0-9a-f]{40}' | cut -d= -f2)
+          git fetch -q origin "$real" || {
+            echo "::error::recorded lineage/sync tip $real is not fetchable — branch moved or deleted; not publishing"
+            exit 1
+          }
+          [ "$(git rev-parse "$HEAD_SHA^{tree}")" = "$(git rev-parse "$real^{tree}")" ] || {
+            echo "::error::reviewed proxy tree != lineage/sync tree ($real) — the sync branch changed after review; re-run the sync for a fresh PR"
             exit 1
           }
 
           # The force-push. The lease fails (instead of destroying
           # work) if anything reached $BRANCH since the snapshot.
           git push --force-with-lease="refs/heads/$BRANCH:$snap" \
-            origin "$HEAD_SHA:refs/heads/$BRANCH"
-          echo "published: $BRANCH ${snap:0:12} → ${HEAD_SHA:0:12}"
+            origin "$real:refs/heads/$BRANCH"
+          echo "published: $BRANCH ${snap:0:12} → ${real:0:12} (reviewed as proxy ${HEAD_SHA:0:12})"
 
-          # Retire the review branches: the decoy, and the sync
-          # branch (its content now IS develop; leaving it would trip
-          # the next cycle's no-clobber check).
+          # Record the parent tip this sync rebased onto: the next
+          # sync replays only this repo's own delta from here
+          # (rebase --onto), instead of the whole inherited stack.
+          onto=$(printf '%s' "$BODY" \
+            | grep -m1 -oE 'lineage-sync:onto=[0-9a-f]{40}' | cut -d= -f2) || true
+          if [ -n "$onto" ]; then
+            git push -f origin "$onto:refs/tags/lineage/base" || true
+          fi
+
+          # Retire the review branches: the decoy, the sync branch
+          # (its content now IS develop; leaving it would trip the
+          # next cycle's no-clobber check), and the review proxy.
           git push origin ":refs/heads/$BASE_REF" || true
           git push origin ":refs/heads/lineage/sync" || true
+          git push origin ":refs/heads/lineage/sync-review" || true
 
       - name: Comment success
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh pr comment "$PR" --body "✅ Published: \`$BRANCH\` force-updated to the reviewed \`${HEAD_SHA:0:12}\` (lease held against \`${BASE_REF#lineage/sync-base-}\`). Decoy base deleted. Consumers of this repo: \`git pull --rebase\`, not \`git pull\`."
+          gh pr comment "$PR" --body "✅ Published: \`$BRANCH\` force-updated to the real rebased history whose tree you reviewed here as proxy \`${HEAD_SHA:0:12}\` (lease held against \`${BASE_REF#lineage/sync-base-}\`). Review branches deleted. Consumers of this repo: \`git pull --rebase\`, not \`git pull\`."
 
       - name: Comment failure
         if: failure()
