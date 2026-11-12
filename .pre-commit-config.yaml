@@ -294,3 +294,5 @@ repos:
     hooks:
       - id: packer_fmt
       - id: packer_validate
+
+# Sandbox: harmless upstream change (2026-11-12T18:55:27Z)
